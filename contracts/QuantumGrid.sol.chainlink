@@ -1,0 +1,475 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
+import "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+
+contract QuantumGrid is VRFConsumerBaseV2 {
+    // Chainlink VRF Configuration
+    bytes32 internal keyHash;
+    uint256 internal fee;
+    
+    // Price Feed for MATIC/USD
+    AggregatorV3Interface internal priceFeed;
+    
+    // Game Structures
+    struct GameSession {
+        address player;
+        uint256 betAmount;
+        uint256 gridSize;
+        uint256 quantumFields;
+        uint256 difficulty;
+        uint256 startTime;
+        bool isActive;
+        bytes32 requestId;
+        uint256[] quantumPositions;
+    }
+    
+    struct GameResult {
+        address player;
+        uint256 betAmount;
+        uint256 score;
+        uint256 winnings;
+        uint256 timestamp;
+        bool claimed;
+        uint256 revealedCells;
+        uint256 totalSafeCells;
+        uint256 difficulty;
+    }
+    
+    struct PlayerStats {
+        uint256 totalGamesPlayed;
+        uint256 totalWinnings;
+        uint256 bestScore;
+        uint256 winStreak;
+        uint256 longestWinStreak;
+        uint256 lastGameTime;
+    }
+    
+    struct LeaderboardEntry {
+        address player;
+        uint256 score;
+        uint256 timestamp;
+    }
+    
+    // State Variables
+    mapping(address => GameSession) public activeGames;
+    mapping(address => GameResult[]) public playerGames;
+    mapping(address => uint256) public playerWinnings;
+    mapping(address => PlayerStats) public playerStats;
+    mapping(bytes32 => address) public requestToPlayer;
+    
+    // Leaderboards
+    LeaderboardEntry[] public dailyLeaderboard;
+    LeaderboardEntry[] public weeklyLeaderboard;
+    LeaderboardEntry[] public allTimeLeaderboard;
+    
+    // Contract State
+    address public owner;
+    uint256 public houseBalance;
+    uint256 public totalGamesPlayed;
+    uint256 public totalWinningsPaid;
+    uint256 public houseFee = 3; // 3% house fee (reduced from 5%)
+    uint256 public maxBetAmount = 100 ether; // Maximum bet limit
+    uint256 public minBetAmount = 0.001 ether; // Minimum bet limit
+    
+    // Game Configuration
+    uint256 public constant MAX_GRID_SIZE = 16;
+    uint256 public constant MIN_GRID_SIZE = 6;
+    uint256 public constant MAX_QUANTUM_FIELDS = 50;
+    
+    // Events
+    event GameStarted(address indexed player, uint256 betAmount, uint256 gridSize, uint256 quantumFields, uint256 difficulty);
+    event GameCompleted(address indexed player, uint256 betAmount, uint256 score, uint256 winnings, bool won);
+    event WinningsClaimed(address indexed player, uint256 amount);
+    event HouseFunded(address indexed owner, uint256 amount);
+    event LeaderboardUpdated(address indexed player, uint256 score, uint256 position);
+    event PlayerStatsUpdated(address indexed player, uint256 totalGames, uint256 totalWinnings, uint256 bestScore);
+    
+    // Modifiers
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    modifier nonReentrant() {
+        require(!_locked, "Reentrant call");
+        _locked = true;
+        _;
+        _locked = false;
+    }
+    
+    modifier gameActive(address player) {
+        require(activeGames[player].isActive, "No active game");
+        _;
+    }
+    
+    modifier validBet(uint256 betAmount) {
+        require(betAmount >= minBetAmount && betAmount <= maxBetAmount, "Invalid bet amount");
+        require(houseBalance >= betAmount * 20, "Insufficient house balance");
+        _;
+    }
+    
+    bool private _locked;
+    
+    constructor(
+        address _vrfCoordinator,
+        address _linkToken,
+        bytes32 _keyHash,
+        uint256 _fee,
+        address _priceFeed
+    ) VRFConsumerBaseV2(_vrfCoordinator) {
+        owner = msg.sender;
+        keyHash = _keyHash;
+        fee = _fee;
+        priceFeed = AggregatorV3Interface(_priceFeed);
+    }
+    
+    // Fund the house with MATIC
+    function fundHouse() external payable onlyOwner {
+        houseBalance += msg.value;
+        emit HouseFunded(msg.sender, msg.value);
+    }
+    
+    // Start a new game with VRF randomness
+    function startGame(
+        uint256 gridSize,
+        uint256 quantumFields,
+        uint256 difficulty
+    ) external payable nonReentrant validBet(msg.value) {
+        require(!activeGames[msg.sender].isActive, "Game already active");
+        require(gridSize >= MIN_GRID_SIZE && gridSize <= MAX_GRID_SIZE, "Invalid grid size");
+        require(quantumFields <= MAX_QUANTUM_FIELDS && quantumFields < gridSize * gridSize, "Too many quantum fields");
+        require(LINK.balanceOf(address(this)) >= fee, "Not enough LINK for VRF");
+        
+        // Create game session
+        activeGames[msg.sender] = GameSession({
+            player: msg.sender,
+            betAmount: msg.value,
+            gridSize: gridSize,
+            quantumFields: quantumFields,
+            difficulty: difficulty,
+            startTime: block.timestamp,
+            isActive: true,
+            requestId: bytes32(0),
+            quantumPositions: new uint256[](0)
+        });
+        
+        // Request randomness from Chainlink VRF
+        bytes32 requestId = requestRandomness(keyHash, fee);
+        requestToPlayer[requestId] = msg.sender;
+        activeGames[msg.sender].requestId = requestId;
+        
+        // Add bet to house balance
+        houseBalance += msg.value;
+        
+        emit GameStarted(msg.sender, msg.value, gridSize, quantumFields, difficulty);
+    }
+    
+    // VRF callback to generate quantum field positions
+    function fulfillRandomness(bytes32 requestId, uint256 randomness) internal override {
+        address player = requestToPlayer[requestId];
+        require(activeGames[player].isActive, "Game not active");
+        
+        GameSession storage game = activeGames[player];
+        uint256[] memory positions = new uint256[](game.quantumFields);
+        uint256 gridSize = game.gridSize;
+        uint256 totalCells = gridSize * gridSize;
+        
+        // Generate unique quantum field positions using VRF
+        for (uint256 i = 0; i < game.quantumFields; i++) {
+            uint256 position;
+            bool isUnique;
+            
+            do {
+                position = (randomness + i) % totalCells;
+                isUnique = true;
+                
+                // Check if position is already used
+                for (uint256 j = 0; j < i; j++) {
+                    if (positions[j] == position) {
+                        isUnique = false;
+                        randomness = uint256(keccak256(abi.encodePacked(randomness, i, j)));
+                        break;
+                    }
+                }
+            } while (!isUnique);
+            
+            positions[i] = position;
+        }
+        
+        game.quantumPositions = positions;
+    }
+    
+    // Submit game result with enhanced validation
+    function submitGameResult(
+        uint256 score,
+        uint256 revealedCells,
+        uint256[] calldata revealedPositions,
+        bytes32 gameHash
+    ) external nonReentrant gameActive(msg.sender) {
+        GameSession storage game = activeGames[msg.sender];
+        require(game.quantumPositions.length > 0, "Game not ready");
+        require(block.timestamp <= game.startTime + 1 hours, "Game expired");
+        
+        // Validate game hash
+        bytes32 calculatedHash = keccak256(abi.encodePacked(
+            game.player,
+            game.betAmount,
+            game.gridSize,
+            game.quantumPositions,
+            revealedPositions,
+            score,
+            block.timestamp
+        ));
+        require(calculatedHash == gameHash, "Invalid game hash");
+        
+        // Calculate winnings with enhanced algorithm
+        uint256 winnings = calculateAdvancedWinnings(
+            game.betAmount,
+            score,
+            revealedCells,
+            game.gridSize * game.gridSize - game.quantumFields,
+            game.difficulty,
+            game.quantumPositions,
+            revealedPositions
+        );
+        
+        // Update player stats
+        PlayerStats storage stats = playerStats[msg.sender];
+        stats.totalGamesPlayed++;
+        stats.lastGameTime = block.timestamp;
+        
+        if (score > stats.bestScore) {
+            stats.bestScore = score;
+        }
+        
+        if (winnings > 0) {
+            stats.totalWinnings += winnings;
+            stats.winStreak++;
+            if (stats.winStreak > stats.longestWinStreak) {
+                stats.longestWinStreak = stats.winStreak;
+            }
+            playerWinnings[msg.sender] += winnings;
+        } else {
+            stats.winStreak = 0;
+        }
+        
+        // Store game result
+        playerGames[msg.sender].push(GameResult({
+            player: msg.sender,
+            betAmount: game.betAmount,
+            score: score,
+            winnings: winnings,
+            timestamp: block.timestamp,
+            claimed: false,
+            revealedCells: revealedCells,
+            totalSafeCells: game.gridSize * game.gridSize - game.quantumFields,
+            difficulty: game.difficulty
+        }));
+        
+        // Update leaderboards
+        updateLeaderboards(msg.sender, score);
+        
+        // End game session
+        activeGames[msg.sender].isActive = false;
+        totalGamesPlayed++;
+        
+        emit GameCompleted(msg.sender, game.betAmount, score, winnings, winnings > 0);
+        emit PlayerStatsUpdated(msg.sender, stats.totalGamesPlayed, stats.totalWinnings, stats.bestScore);
+    }
+    
+    // Enhanced winnings calculation with quantum field detection
+    function calculateAdvancedWinnings(
+        uint256 betAmount,
+        uint256 score,
+        uint256 revealedCells,
+        uint256 totalSafeCells,
+        uint256 difficulty,
+        uint256[] memory quantumPositions,
+        uint256[] memory revealedPositions
+    ) internal pure returns (uint256) {
+        if (revealedCells == 0) return 0;
+        
+        // Base multipliers
+        uint256 scoreMultiplier = (score * 1e18) / 1000;
+        if (scoreMultiplier < 1e17) scoreMultiplier = 1e17; // Min 0.1x
+        if (scoreMultiplier > 3e18) scoreMultiplier = 3e18; // Max 3x
+        
+        uint256 progressMultiplier = (revealedCells * 1e18) / totalSafeCells;
+        if (progressMultiplier < 1e17) progressMultiplier = 1e17;
+        
+        uint256 difficultyMultiplier = (difficulty * 1e18) / 100 + 8e17;
+        
+        // Quantum field proximity bonus
+        uint256 proximityBonus = calculateProximityBonus(quantumPositions, revealedPositions);
+        
+        // Final calculation
+        uint256 finalMultiplier = (scoreMultiplier * progressMultiplier * difficultyMultiplier * proximityBonus) / (1e18 * 1e18 * 1e18);
+        uint256 winnings = (betAmount * finalMultiplier) / 1e18;
+        
+        // Apply house fee
+        uint256 houseFeeAmount = (winnings * 3) / 100; // 3% house fee
+        winnings = winnings - houseFeeAmount;
+        
+        return winnings;
+    }
+    
+    // Calculate proximity bonus for revealing cells near quantum fields
+    function calculateProximityBonus(
+        uint256[] memory quantumPositions,
+        uint256[] memory revealedPositions
+    ) internal pure returns (uint256) {
+        uint256 bonus = 1e18; // Base 1x multiplier
+        
+        for (uint256 i = 0; i < revealedPositions.length; i++) {
+            for (uint256 j = 0; j < quantumPositions.length; j++) {
+                // Calculate distance (simplified)
+                uint256 distance = quantumPositions[j] > revealedPositions[i] 
+                    ? quantumPositions[j] - revealedPositions[i]
+                    : revealedPositions[i] - quantumPositions[j];
+                
+                if (distance <= 1) {
+                    bonus = (bonus * 12) / 10; // 20% bonus for adjacent cells
+                }
+            }
+        }
+        
+        return bonus;
+    }
+    
+    // Update leaderboards
+    function updateLeaderboards(address player, uint256 score) internal {
+        LeaderboardEntry memory entry = LeaderboardEntry({
+            player: player,
+            score: score,
+            timestamp: block.timestamp
+        });
+        
+        // Update daily leaderboard (keep top 100)
+        updateLeaderboard(dailyLeaderboard, entry, 100);
+        
+        // Update weekly leaderboard (keep top 50)
+        updateLeaderboard(weeklyLeaderboard, entry, 50);
+        
+        // Update all-time leaderboard (keep top 25)
+        updateLeaderboard(allTimeLeaderboard, entry, 25);
+    }
+    
+    // Helper function to update a leaderboard
+    function updateLeaderboard(
+        LeaderboardEntry[] storage leaderboard,
+        LeaderboardEntry memory entry,
+        uint256 maxSize
+    ) internal {
+        // Find insertion point
+        uint256 insertIndex = leaderboard.length;
+        for (uint256 i = 0; i < leaderboard.length; i++) {
+            if (entry.score > leaderboard[i].score) {
+                insertIndex = i;
+                break;
+            }
+        }
+        
+        // Insert new entry
+        if (insertIndex < maxSize) {
+            leaderboard.push(entry);
+            
+            // Sort by score (descending)
+            for (uint256 i = leaderboard.length - 1; i > insertIndex; i--) {
+                if (leaderboard[i].score > leaderboard[i-1].score) {
+                    LeaderboardEntry memory temp = leaderboard[i];
+                    leaderboard[i] = leaderboard[i-1];
+                    leaderboard[i-1] = temp;
+                }
+            }
+            
+            // Trim to max size
+            if (leaderboard.length > maxSize) {
+                delete leaderboard[maxSize];
+                // Note: This is simplified - in production, you'd want proper array trimming
+            }
+        }
+    }
+    
+    // Claim accumulated winnings
+    function claimWinnings() external nonReentrant {
+        uint256 amount = playerWinnings[msg.sender];
+        require(amount > 0, "No winnings to claim");
+        require(houseBalance >= amount, "Insufficient house balance");
+        
+        playerWinnings[msg.sender] = 0;
+        houseBalance -= amount;
+        totalWinningsPaid += amount;
+        
+        payable(msg.sender).transfer(amount);
+        emit WinningsClaimed(msg.sender, amount);
+    }
+    
+    // Get current MATIC price in USD
+    function getMaticPrice() public view returns (int256) {
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+        return price;
+    }
+    
+    // Get player statistics
+    function getPlayerStats(address player) external view returns (PlayerStats memory) {
+        return playerStats[player];
+    }
+    
+    // Get leaderboard data
+    function getDailyLeaderboard() external view returns (LeaderboardEntry[] memory) {
+        return dailyLeaderboard;
+    }
+    
+    function getWeeklyLeaderboard() external view returns (LeaderboardEntry[] memory) {
+        return weeklyLeaderboard;
+    }
+    
+    function getAllTimeLeaderboard() external view returns (LeaderboardEntry[] memory) {
+        return allTimeLeaderboard;
+    }
+    
+    // Emergency functions (owner only)
+    function emergencyWithdraw() external onlyOwner {
+        payable(owner).transfer(houseBalance);
+        houseBalance = 0;
+    }
+    
+    function setBetLimits(uint256 _minBet, uint256 _maxBet) external onlyOwner {
+        minBetAmount = _minBet;
+        maxBetAmount = _maxBet;
+    }
+    
+    function setHouseFee(uint256 newFee) external onlyOwner {
+        require(newFee <= 1000, "Fee too high"); // Max 10%
+        houseFee = newFee;
+    }
+    
+    // Get comprehensive contract statistics
+    function getStats() external view returns (
+        uint256 _houseBalance,
+        uint256 _totalGamesPlayed,
+        uint256 _totalWinningsPaid,
+        uint256 _houseFee,
+        uint256 _minBet,
+        uint256 _maxBet,
+        int256 _maticPrice
+    ) {
+        return (
+            houseBalance,
+            totalGamesPlayed,
+            totalWinningsPaid,
+            houseFee,
+            minBetAmount,
+            maxBetAmount,
+            getMaticPrice()
+        );
+    }
+    
+    // Receive function for direct MATIC transfers
+    receive() external payable {
+        houseBalance += msg.value;
+    }
+}
