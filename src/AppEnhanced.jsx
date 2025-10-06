@@ -415,7 +415,7 @@ const Game = () => {
         transition={{ duration: 0.8 }}
       >
         <div className="header-top">
-          <h1 className="game-title">Enhanced Quantum Grid</h1>
+          <h1 className="game-title"> Quantum Grid</h1>
           <div className="header-actions">
             <button 
               className="quantum-button btn-secondary"
@@ -1033,7 +1033,7 @@ const App = () => {
           transition={{ duration: 0.8 }}
         >
           <div className="header-top">
-            <h1 className="game-title">Enhanced Quantum Grid</h1>
+            <h1 className="game-title">Quantum Grid</h1>
             <div className="header-actions">
               <button 
                 className="quantum-button btn-secondary"
@@ -1230,7 +1230,7 @@ const App = () => {
             transition={{ delay: 0.6, duration: 0.8 }}
           >
             <div className="game-info">
-              <h3>Enhanced Quantum Grid Features</h3>
+              <h3> Quantum Grid Features</h3>
               <div className="features-grid">
                 <div className="feature-card">
                   <Brain size={24} />
